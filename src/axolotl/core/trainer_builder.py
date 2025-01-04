@@ -600,14 +600,20 @@ class AxolotlTrainer(SchedulerMixin, Trainer):
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.args.sample_packing and not self.args.pretraining:
             if self.args.multipack_real_batches:
-                batch_size = self.args.per_device_train_batch_size
+                if self.is_megatron_enabled:
+                    batch_size = self._train_batch_size * self.args.gradient_accumulation_steps
+                else:
+                    batch_size = self.args.per_device_train_batch_size
                 batch_max_len = self.args.max_seq_length
             else:
                 batch_size = 1
-                train_batch_size = (
-                    self.state.train_batch_size or self.args.per_device_train_batch_size
-                )
-                batch_max_len = train_batch_size * self.args.max_seq_length
+                if self.is_megatron_enabled:
+                    train_batch_size = self._train_batch_size * self.args.gradient_accumulation_steps
+                else:
+                    train_batch_size = (
+                        self.state.train_batch_size or self.args.per_device_train_batch_size
+                    )
+                
             return MultipackBatchSampler(
                 RandomSampler(self.train_dataset),
                 lengths=get_dataset_lengths(self.train_dataset),
@@ -627,13 +633,21 @@ class AxolotlTrainer(SchedulerMixin, Trainer):
     ) -> Optional[torch.utils.data.Sampler]:
         if self.args.sample_packing and self.args.eval_sample_packing is not False:
             if self.args.multipack_real_batches:
-                batch_size = self.args.per_device_eval_batch_size
                 batch_max_len = self.args.max_seq_length
+                if self.is_megatron_enabled:
+                    batch_size = self._eval_batch_size * self.args.gradient_accumulation_steps
+                else:
+                    batch_size = self.args.per_device_eval_batch_size
             else:
-                batch_size = 1
-                batch_max_len = (
-                    self.args.per_device_eval_batch_size * self.args.max_seq_length
-                )
+                if self.is_megatron_enabled:
+                    eval_batch_size = self._eval_batch_size * self.args.gradient_accumulation_steps
+                    batch_size = self._eval_batch_size * self.args.gradient_accumulation_steps
+                else:
+                    eval_batch_size = (
+                        self.state.eval_batch_size or self.args.per_device_eval_batch_size
+                    )
+                    batch_size = 1
+                batch_max_len = eval_batch_size * self.args.max_seq_length
             return MultipackBatchSampler(
                 SequentialSampler(eval_dataset),
                 lengths=get_dataset_lengths(self.eval_dataset),
@@ -673,6 +687,10 @@ class AxolotlTrainer(SchedulerMixin, Trainer):
             dataloader_params["worker_init_fn"] = seed_worker
 
             self.accelerator.even_batches = False
+
+            if self.is_megatron_enabled:
+                return DataLoader(train_dataset, **dataloader_params)
+
             return self.accelerator.prepare_data_loader(
                 DataLoader(train_dataset, **dataloader_params)
             )
@@ -696,11 +714,16 @@ class AxolotlTrainer(SchedulerMixin, Trainer):
                 eval_dataset if eval_dataset is not None else self.eval_dataset
             )
 
+            if self.is_megatron_enabled:
+                eval_batch_size = self._eval_batch_size
+            else:
+                eval_batch_size = self.args.eval_batch_size
+
             eval_sampler = self._get_eval_sampler(eval_dataset)
             eval_dataset = eval_dataset.remove_columns(["length"])
             data_collator = self.data_collator
             dataloader_params = {
-                "batch_size": self.args.eval_batch_size,
+                "batch_size": eval_batch_size,
                 "collate_fn": data_collator,
                 "num_workers": self.args.dataloader_num_workers,
                 "pin_memory": self.args.dataloader_pin_memory,
@@ -718,6 +741,10 @@ class AxolotlTrainer(SchedulerMixin, Trainer):
                 dataloader_params["drop_last"] = self.args.dataloader_drop_last
 
             self.accelerator.even_batches = False
+
+            if self.is_megatron_enabled:
+                return DataLoader(eval_dataset, **dataloader_params)
+
             return self.accelerator.prepare_data_loader(
                 DataLoader(eval_dataset, **dataloader_params)
             )
@@ -735,8 +762,14 @@ class AxolotlTrainer(SchedulerMixin, Trainer):
         self,
         bench_dataset: Dataset,
     ) -> DataLoader:
+
+        if self.is_megatron_enabled:
+            bench_batch_size = self._eval_batch_size
+        else:
+            bench_batch_size = self.args.eval_batch_size
+        
         dataloader_params = {
-            "batch_size": self.args.eval_batch_size,
+            "batch_size": bench_batch_size,
             "collate_fn": self.bench_data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
